@@ -1,0 +1,12 @@
+import mongoose from 'mongoose';
+
+export const validateObjectId = (paramName = 'id') => (req, res, next) => {
+    if (!mongoose.isObjectIdOrHexString(req.params[paramName])) {
+        return res.status(400).json({
+            success: false,
+            message: `Invalid ${paramName}`,
+        });
+    }
+
+    next();
+};

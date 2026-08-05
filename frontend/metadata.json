@@ -1,0 +1,6 @@
+{
+  "name": "AI Code Review",
+  "description": "AI-powered code review for modern developers.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
