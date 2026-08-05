@@ -1,41 +1,12 @@
-import ai from "../config/ai.js";
+import ai, { GEMINI_MODEL, DEEPSEEK_API_KEY, OPENAI_API_KEY } from "../config/ai.js";
 import { buildCodeReviewPrompt } from "../utils/prompts.js";
+import axios from 'axios';
 
-const fallbackReview = (code, language) => ({
-    score: 82,
-    categories: {
-        security: 78,
-        performance: 80,
-        quality: 84,
-        maintainability: 86,
-        readability: 88,
-        bestPractices: 84,
-    },
-    summary: `A fallback review was generated for ${language || "the submitted code"
-        } because Gemini was unavailable.`,
-    bugs: [],
-    securityIssues: [],
-    performanceIssues: [],
-    suggestions: [
-        "Add unit tests.",
-        "Improve documentation.",
-        "Follow best practices."
-    ],
-    improvedCode: code,
-});
+const buildPrompt = (code, language) => {
+    return `You are an expert senior software engineer.
 
-export const reviewCode = async (code, language) => {
-    try {
-        if (!ai) {
-            throw new Error("Gemini API key is not configured.");
-        }
-
-        const prompt = buildCodeReviewPrompt(code, language);
-
-        const fullPrompt = `
-You are an expert senior software engineer.
-
-Return ONLY valid JSON.
+Return ONLY valid JSON. The "suggestions" field must be an array of STRINGS only (not objects). 
+The "bugs", "securityIssues", and "performanceIssues" fields must be arrays of objects with: severity, description, line, file.
 
 The JSON must follow this structure exactly:
 
@@ -49,40 +20,231 @@ The JSON must follow this structure exactly:
     "readability": number,
     "bestPractices": number
   },
-  "summary": "",
-  "bugs": [],
-  "securityIssues": [],
-  "performanceIssues": [],
-  "suggestions": [],
-  "improvedCode": ""
+  "summary": "string",
+  "bugs": [{"severity": "high/medium/low", "description": "string", "line": number, "file": "string"}],
+  "securityIssues": [{"severity": "high/medium/low", "description": "string", "line": number, "file": "string"}],
+  "performanceIssues": [{"severity": "high/medium/low", "description": "string", "line": number, "file": "string"}],
+  "suggestions": ["string", "string"],
+  "improvedCode": "string"
 }
 
 Review this code:
 
-${prompt}
-`;
+${buildCodeReviewPrompt(code, language)}`;
+};
 
-        const response = await ai.models.generateContent({
-            model: process.env.GEMINI_MODEL || "gemini-2.5-flash",
-            contents: fullPrompt,
+const sanitizeReview = (review) => {
+    // Ensure suggestions is array of strings
+    if (Array.isArray(review.suggestions)) {
+        review.suggestions = review.suggestions.map(s => {
+            if (typeof s === 'string') return s;
+            if (typeof s === 'object' && s !== null) {
+                return s.suggestion || s.message || s.description || JSON.stringify(s);
+            }
+            return String(s);
         });
-
-        const text = response.text;
-
-        if (!text) {
-            throw new Error("Gemini returned an empty response.");
-        }
-
-        const cleaned = text
-            .replace(/```json/g, "")
-            .replace(/```/g, "")
-            .trim();
-
-        return JSON.parse(cleaned);
-
-    } catch (error) {
-        console.error("Gemini Error:", error.message);
-
-        return fallbackReview(code, language);
+    } else {
+        review.suggestions = [];
     }
+
+    // Ensure bugs is array of objects with correct structure
+    if (Array.isArray(review.bugs)) {
+        review.bugs = review.bugs.map(b => ({
+            severity: b.severity || 'low',
+            description: b.description || b.message || '',
+            line: b.line || 0,
+            file: b.file || ''
+        }));
+    } else {
+        review.bugs = [];
+    }
+
+    // Ensure securityIssues is array of objects
+    if (Array.isArray(review.securityIssues)) {
+        review.securityIssues = review.securityIssues.map(s => ({
+            severity: s.severity || 'low',
+            description: s.description || s.message || '',
+            line: s.line || 0,
+            file: s.file || ''
+        }));
+    } else {
+        review.securityIssues = [];
+    }
+
+    // Ensure performanceIssues is array of objects
+    if (Array.isArray(review.performanceIssues)) {
+        review.performanceIssues = review.performanceIssues.map(p => ({
+            severity: p.severity || 'low',
+            description: p.description || p.message || '',
+            line: p.line || 0,
+            file: p.file || ''
+        }));
+    } else {
+        review.performanceIssues = [];
+    }
+
+    return review;
+};
+
+const generateLocalReview = (code, language) => {
+    const lines = code.split('\n').length;
+    const hasComments = code.includes('//') || code.includes('/*');
+    const hasErrorHandling = code.includes('try') || code.includes('catch');
+    
+    let score = 75;
+    if (hasComments) score += 5;
+    if (hasErrorHandling) score += 5;
+    score = Math.min(score, 95);
+    
+    const suggestions = [];
+    if (!hasComments) suggestions.push("Add comments to explain complex logic");
+    if (!hasErrorHandling) suggestions.push("Implement error handling with try-catch blocks");
+    suggestions.push("Consider adding unit tests");
+    
+    console.log("Review generated by: Local Analysis");
+    return {
+        score,
+        categories: {
+            security: hasErrorHandling ? 82 : 72,
+            performance: 80,
+            quality: hasComments ? 85 : 78,
+            maintainability: hasComments ? 83 : 75,
+            readability: hasComments ? 88 : 80,
+            bestPractices: hasErrorHandling ? 84 : 76
+        },
+        summary: `Analysis of ${language || 'code'}. Score: ${score}/100.`,
+        bugs: [],
+        securityIssues: [],
+        performanceIssues: [],
+        suggestions,
+        improvedCode: code
+    };
+};
+
+const reviewWithGemini = async (code, language) => {
+    if (!ai) throw new Error("Gemini not configured");
+    
+    const fullPrompt = buildPrompt(code, language);
+    
+    const interaction = await ai.interactions.create({
+        model: GEMINI_MODEL,
+        input: fullPrompt,
+    });
+    
+    const text = interaction.output_text;
+    
+    if (!text) throw new Error("Empty response");
+    
+    const cleaned = text.replace(/```json/g, "").replace(/```/g, "").trim();
+    const parsed = JSON.parse(cleaned);
+    
+    // Sanitize the response to match schema
+    const sanitized = sanitizeReview(parsed);
+    
+    console.log("Review generated by: Gemini AI");
+    return sanitized;
+};
+
+const reviewWithDeepSeek = async (code, language) => {
+    if (!DEEPSEEK_API_KEY) throw new Error("DeepSeek not configured");
+    
+    const response = await axios.post(
+        'https://api.deepseek.com/v1/chat/completions',
+        {
+            model: 'deepseek-chat',
+            messages: [
+                { role: 'system', content: 'You are an expert code reviewer. Respond with valid JSON only.' },
+                { role: 'user', content: buildPrompt(code, language) }
+            ],
+            temperature: 0.3,
+            max_tokens: 4000
+        },
+        {
+            headers: {
+                'Content-Type': 'application/json',
+                'Authorization': `Bearer ${DEEPSEEK_API_KEY}`
+            },
+            timeout: 30000
+        }
+    );
+    
+    const text = response.data.choices[0].message.content;
+    const cleaned = text.replace(/```json/g, "").replace(/```/g, "").trim();
+    const parsed = JSON.parse(cleaned);
+    const sanitized = sanitizeReview(parsed);
+    console.log("Review generated by: DeepSeek AI");
+    return sanitized;
+};
+
+const reviewWithOpenAI = async (code, language) => {
+    if (!OPENAI_API_KEY) throw new Error("OpenAI not configured");
+    
+    const response = await axios.post(
+        'https://api.openai.com/v1/chat/completions',
+        {
+            model: 'gpt-3.5-turbo',
+            messages: [
+                { role: 'system', content: 'You are an expert code reviewer. Respond with valid JSON only.' },
+                { role: 'user', content: buildPrompt(code, language) }
+            ],
+            temperature: 0.3,
+            max_tokens: 4000
+        },
+        {
+            headers: {
+                'Content-Type': 'application/json',
+                'Authorization': `Bearer ${OPENAI_API_KEY}`
+            },
+            timeout: 30000
+        }
+    );
+    
+    const text = response.data.choices[0].message.content;
+    const cleaned = text.replace(/```json/g, "").replace(/```/g, "").trim();
+    const parsed = JSON.parse(cleaned);
+    const sanitized = sanitizeReview(parsed);
+    console.log("Review generated by: OpenAI (ChatGPT)");
+    return sanitized;
+};
+
+export const reviewCode = async (code, language) => {
+    // Try Gemini first 
+    if (ai) {
+        try {
+            console.log("Attempting review with Gemini AI...");
+            const result = await reviewWithGemini(code, language);
+            return result;
+        } catch (error) {
+            console.log("Gemini failed:", error.message);
+         
+        }
+    }
+    
+    // Try DeepSeek only if Gemini failed
+    if (DEEPSEEK_API_KEY) {
+        try {
+            console.log("Attempting review with DeepSeek AI...");
+            const result = await reviewWithDeepSeek(code, language);
+            return result; 
+        } catch (error) {
+            console.log("DeepSeek failed:", error.message);
+           
+        }
+    }
+    
+    // Try OpenAI only if both above failed
+    if (OPENAI_API_KEY) {
+        try {
+            console.log("Attempting review with OpenAI...");
+            const result = await reviewWithOpenAI(code, language);
+            return result; 
+        } catch (error) {
+            console.log("OpenAI failed:", error.message);
+            
+        }
+    }
+    
+    // Local fallback - only if ALL APIs failed
+    console.log("All AI APIs failed. Generating local review...");
+    return generateLocalReview(code, language);
 };
